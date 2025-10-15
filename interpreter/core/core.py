@@ -19,6 +19,7 @@ from .llm.llm import Llm
 from .respond import respond
 from .utils.telemetry import send_telemetry
 from .utils.truncate_output import truncate_output
+from ..capture import take_screenshot
 
 
 class OpenInterpreter:
@@ -145,23 +146,76 @@ class OpenInterpreter:
         self = local_setup(self)
 
     def wait(self):
+        """
+        Block until the current responding loop finishes and return any
+        messages that were added during the current response cycle.
+
+        This is a convenience for callers that want to synchronously wait for
+        the interpreter to complete handling a message. The method polls the
+        `self.responding` flag and returns the slice of `self.messages`
+        produced since the last call (using `self.last_messages_count`).
+
+        Returns:
+            list: A list of messages appended during the last response.
+        """
         while self.responding:
             time.sleep(0.2)
-        # Return new messages
+        # Return new messages (messages appended since last_messages_count)
         return self.messages[self.last_messages_count :]
 
     @property
     def anonymous_telemetry(self) -> bool:
+        """
+        Decide whether anonymous telemetry is enabled.
+
+        The interpreter only sends anonymous telemetry when telemetry hasn't
+        been explicitly disabled and the interpreter is not operating in
+        offline mode. This property centralizes that logic for callers.
+        """
         return not self.disable_telemetry and not self.offline
 
     @property
     def will_contribute(self):
+        """
+        Determine whether the interpreter should contribute conversations
+        (e.g., upload or save telemetry/usage data).
+
+        Contributing is disabled when any of the following override flags are
+        set: offline mode, conversation_history disabled, or telemetry
+        explicitly disabled. If `contribute_conversation` is True and no
+        overrides are present, this property returns True.
+        """
         overrides = (
             self.offline or not self.conversation_history or self.disable_telemetry
         )
         return self.contribute_conversation and not overrides
 
     def chat(self, message=None, display=True, stream=False, blocking=True):
+        """
+        Primary chat entrypoint.
+
+        This method orchestrates sending a message (or messages) into the
+        interpreter and returning the resulting messages. It supports three
+        modes:
+          - display=True with stream=True: returns a generator that yields
+            rendering/display events (used by the terminal UI).
+          - stream=False: consumes the streaming generator and returns the
+            completed set of messages added during the call.
+          - blocking=False: runs the chat operation in a background thread.
+
+        Parameters:
+            message (str|dict|list): The incoming message(s) to process.
+            display (bool): Whether to render via the terminal interface.
+            stream (bool): If True, return a generator that yields streaming
+                chunks instead of materializing the full response.
+            blocking (bool): If False, run in a background thread and return
+                immediately.
+
+        Returns:
+            list|generator|None: Depending on the mode, returns the new
+            messages list, a streaming generator, or None for background
+            invocations.
+        """
         try:
             self.responding = True
             if self.anonymous_telemetry:
@@ -215,10 +269,16 @@ class OpenInterpreter:
             raise
 
     def _streaming_chat(self, message=None, display=True):
-        # Sometimes a little more code -> a much better experience!
-        # Display mode actually runs interpreter.chat(display=False, stream=True) from within the terminal_interface.
-        # wraps the vanilla .chat(display=False) generator in a display.
-        # Quite different from the plain generator stuff. So redirect to that
+        """
+        Internal streaming chat implementation.
+
+        When `display=True` this delegates to `terminal_interface(...)` which
+        handles rendering UI components, progress indicators, and user
+        interactions. When `display=False` this method implements the
+        non-UI streaming behavior that appends LMC message chunks to
+        `self.messages` by pulling from `respond(self)`.
+        """
+        # If display/rendering is requested, hand control to the UI layer.
         if display:
             yield from terminal_interface(self, message)
             return
@@ -296,19 +356,25 @@ class OpenInterpreter:
 
     def _respond_and_store(self):
         """
-        Pulls from the respond stream, adding delimiters. Some things, like active_line, console, confirmation... these act specially.
-        Also assembles new messages and adds them to `self.messages`.
+        Consume the `respond(self)` generator, persist messages, and yield
+        streaming flags/chunks for the UI layer.
+
+        This implementation preserves the original behavior: grouping
+        consecutive chunks into messages, emitting `start`/`end` flags,
+        handling special chunk types (confirmation, active_line), and
+        truncating long console outputs.
         """
+        # Ensure we are not noisy by default during the respond/store loop.
         self.verbose = False
 
-        # Utility function
         def is_ephemeral(chunk):
-            """
-            Ephemeral = this chunk doesn't contribute to a message we want to save.
+            """Return True for chunks that should not be saved to conversation history.
+
+            Ephemeral chunks include active_line markers and review chunks.
             """
             if "format" in chunk and chunk["format"] == "active_line":
                 return True
-            if chunk["type"] == "review":
+            if chunk.get("type") == "review":
                 return True
             return False
 
@@ -316,21 +382,22 @@ class OpenInterpreter:
 
         try:
             for chunk in respond(self):
-                # For async usage
+                # For async usage: stop if requested
                 if hasattr(self, "stop_event") and self.stop_event.is_set():
                     print("Open Interpreter stopping.")
                     break
 
-                if chunk["content"] == "":
+                # Skip empty content chunks
+                if chunk.get("content", "") == "":
                     continue
 
                 # If active_line is None, we finished running code.
                 if (
                     chunk.get("format") == "active_line"
-                    and chunk.get("content", "") == None
+                    and chunk.get("content", None) is None
                 ):
-                    # If output wasn't yet produced, add an empty output
-                    if self.messages[-1]["role"] != "computer":
+                    # If output wasn't yet produced, add an empty output message
+                    if self.messages and self.messages[-1].get("role") != "computer":
                         self.messages.append(
                             {
                                 "role": "computer",
@@ -340,29 +407,18 @@ class OpenInterpreter:
                             }
                         )
 
-                # Handle the special "confirmation" chunk, which neither triggers a flag or creates a message
-                if chunk["type"] == "confirmation":
-                    # Emit a end flag for the last message type, and reset last_flag_base
+                # Handle the special "confirmation" chunk, which neither triggers a flag nor creates a message
+                if chunk.get("type") == "confirmation":
+                    # Emit an end flag for the last message type, and reset last_flag_base
                     if last_flag_base:
                         yield {**last_flag_base, "end": True}
                         last_flag_base = None
 
-                    if self.auto_run == False:
+                    if not self.auto_run:
                         yield chunk
-
-                    # We want to append this now, so even if content is never filled, we know that the execution didn't produce output.
-                    # ... rethink this though.
-                    # self.messages.append(
-                    #     {
-                    #         "role": "computer",
-                    #         "type": "console",
-                    #         "format": "output",
-                    #         "content": "",
-                    #     }
-                    # )
                     continue
 
-                # Check if the chunk's role, type, and format (if present) match the last_flag_base
+                # Determine whether this chunk continues the previous message
                 if (
                     last_flag_base
                     and "role" in chunk
@@ -371,75 +427,112 @@ class OpenInterpreter:
                     and last_flag_base["type"] == chunk["type"]
                     and (
                         "format" not in last_flag_base
-                        or (
-                            "format" in chunk
-                            and chunk["format"] == last_flag_base["format"]
-                        )
+                        or ("format" in chunk and chunk.get("format") == last_flag_base.get("format"))
                     )
                 ):
-                    # If they match, append the chunk's content to the current message's content
-                    # (Except active_line, which shouldn't be stored)
+                    # Append content to the existing message unless ephemeral
                     if not is_ephemeral(chunk):
                         if any(
                             [
-                                (property in self.messages[-1])
-                                and (
-                                    self.messages[-1].get(property)
-                                    != chunk.get(property)
-                                )
-                                for property in ["role", "type", "format"]
+                                (prop in self.messages[-1])
+                                and (self.messages[-1].get(prop) != chunk.get(prop))
+                                for prop in ["role", "type", "format"]
                             ]
                         ):
                             self.messages.append(chunk)
                         else:
-                            self.messages[-1]["content"] += chunk["content"]
+                            self.messages[-1]["content"] += chunk.get("content", "")
                 else:
-                    # If they don't match, yield a end message for the last message type and a start message for the new one
+                    # New message boundary: yield end for previous and start for new
                     if last_flag_base:
                         yield {**last_flag_base, "end": True}
 
-                    last_flag_base = {"role": chunk["role"], "type": chunk["type"]}
+                    last_flag_base = {"role": chunk.get("role"), "type": chunk.get("type")}
 
                     # Don't add format to type: "console" flags, to accommodate active_line AND output formats
-                    if "format" in chunk and chunk["type"] != "console":
-                        last_flag_base["format"] = chunk["format"]
+                    if "format" in chunk and chunk.get("type") != "console":
+                        last_flag_base["format"] = chunk.get("format")
 
                     yield {**last_flag_base, "start": True}
 
-                    # Add the chunk as a new message
+                    # Add the chunk as a new message (unless ephemeral)
                     if not is_ephemeral(chunk):
+                        # If the incoming chunk is a code message, capture the current
+                        # screen and append an image message immediately BEFORE the
+                        # code message. This records the UI state the model saw.
+                        if chunk.get("type") == "code":
+                            try:
+                                screenshot_path = take_screenshot()
+                                self.messages.append(
+                                    {
+                                        "role": chunk.get("role", "assistant"),
+                                        "type": "image",
+                                        "format": "path",
+                                        "content": screenshot_path,
+                                    }
+                                )
+                            except Exception as e:
+                                if getattr(self, "debug", False):
+                                    print(
+                                        "Warning: failed to capture screenshot before code output:", e
+                                    )
+
                         self.messages.append(chunk)
 
-                # Yield the chunk itself
+                # Yield the chunk itself for the streaming UI
                 yield chunk
 
-                # Truncate output if it's console output
-                if chunk["type"] == "console" and chunk["format"] == "output":
+                # Truncate console outputs to a reasonable length to avoid OOM/UI issues
+                if chunk.get("type") == "console" and chunk.get("format") == "output":
                     self.messages[-1]["content"] = truncate_output(
-                        self.messages[-1]["content"],
+                        self.messages[-1].get("content", ""),
                         self.max_output,
-                        add_scrollbars=self.computer.import_computer_api,  # I consider scrollbars to be a computer API thing
+                        add_scrollbars=self.computer.import_computer_api,
                     )
 
-            # Yield a final end flag
+            # Yield a final end flag for the last open message
             if last_flag_base:
                 yield {**last_flag_base, "end": True}
         except GeneratorExit:
-            raise  # gotta pass this up!
+            raise  # propagate generator exit
 
     def reset(self):
+        """
+        Reset interpreter runtime state.
+
+        This method terminates any running language backends, clears the
+        imported-computer-api flag, and wipes the in-memory message buffer.
+        It does not modify persistent conversation files on disk.
+        """
+        # Terminate running language processes and reset import flags.
         self.computer.terminate()  # Terminates all languages
         self.computer._has_imported_computer_api = False  # Flag reset
+        # Clear in-memory conversation state.
         self.messages = []
         self.last_messages_count = 0
 
     def display_message(self, markdown):
-        # This is just handy for start_script in profiles.
+        """
+        Display a markdown message to the user.
+
+        In terminal-less or scripting contexts `plain_text_display` can be
+        enabled to simply print markdown as plain text; otherwise the
+        terminal UI helper `display_markdown_message` is used to render
+        formatted output.
+        """
+        # This is used by profile start scripts and other programmatic flows.
         if self.plain_text_display:
             print(markdown)
         else:
             display_markdown_message(markdown)
 
     def get_oi_dir(self):
-        # Again, just handy for start_script in profiles.
+        """
+        Return the project-local Open Interpreter directory helper.
+
+        This convenience method is used by scripts and profiles that need
+        to access the repo-specific storage directory (user-level config,
+        caches, etc.). It simply returns the `oi_dir` helper imported from
+        the terminal_interface utilities.
+        """
         return oi_dir
